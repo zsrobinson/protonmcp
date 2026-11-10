@@ -71,7 +71,7 @@ def test_existing_tool_surface_preserved():
     assert {t['name'] for t in mail.TOOLS} == {
         'list_folders', 'list_messages', 'search_messages', 'list_unsubscribe',
         'read_messages', 'create_draft', 'archive_messages', 'move_messages',
-        'add_labels', 'mark_read', 'list_actions'}
+        'add_labels', 'mark_read', 'list_actions', 'unarchive_messages'}
 
 
 @pytest.mark.parametrize('name,target,command', [
@@ -195,6 +195,11 @@ def test_busy_call_does_not_block_ping(monkeypatch):
         assert request('ping')['result'] == {}
         second = request('tools/call')['result']
         assert second['isError'] and 'busy' in second['content'][0]['text']
+        release.set()
+        first.join()
+        server.draining.set()
+        refused = request('tools/call')['result']
+        assert refused['isError'] and 'shutting down' in refused['content'][0]['text']
     finally:
         release.set()
         first.join()
@@ -222,3 +227,272 @@ def test_search_read_timeout_is_controlled(monkeypatch):
     client.uid = Mock(side_effect=TimeoutError())
     with pytest.raises(PublicError, match='timed out waiting for Bridge'):
         mail.Mail(client).search(folder='INBOX')
+
+
+class BatchIMAP(FakeIMAP):
+    def __init__(self, count=120):
+        super().__init__()
+        self.uids = [str(i) for i in range(1, count + 1)]
+        self.copied = []
+        self.sock = Mock()
+        self.fail_chunk = None
+
+    def uid(self, command, *args):
+        self.commands.append((command, *args))
+        if command == 'SEARCH':
+            return 'OK', [' '.join(self.uids).encode()]
+        if command == 'FETCH':
+            return 'OK', [(f'{i} (UID {uid} FLAGS () RFC822.SIZE 200)'.encode(), self.raw)
+                          for i, uid in enumerate(args[0].split(','), 1) if uid in self.uids]
+        if command in ('MOVE', 'COPY', 'STORE'):
+            if sum(c[0] == command for c in self.commands) == self.fail_chunk:
+                return 'NO', [b'Failed']
+            self.copied = [f'1 {args[0]} '.encode() + ','.join(str(int(u) + 1000) for u in args[0].split(',')).encode()]
+            return 'OK', []
+        raise AssertionError(command)
+
+    def response(self, name):
+        if name == 'COPYUID':
+            values, self.copied = self.copied, []
+            return name, values
+        return super().response(name)
+
+
+def archive_args(count=120):
+    return {'folder': 'INBOX', 'uidvalidity': '1', 'uids': [str(i) for i in range(1, count + 1)]}
+
+
+def test_archive_command_counts_and_chunk_journal(tmp_path):
+    client = BatchIMAP()
+    journal = ActionLog(tmp_path / 'private' / 'actions.jsonl')
+    result = mail.call('archive_messages', archive_args(), factory=lambda: client, journal=journal)
+    assert result['completed'] == client.uids
+    assert result['completed_chunks'] == [0, 1, 2]
+    assert [c[0] for c in client.commands].count('SELECT') == 1
+    assert [c[0] for c in client.commands].count('FETCH') == 1
+    assert [c[0] for c in client.commands].count('MOVE') == 3
+    assert [len(c[1].split(',')) for c in client.commands if c[0] == 'MOVE'] == [50, 50, 20]
+    records = journal.recent()['entries']
+    assert len(records) == 6
+    assert {r['action_id'] for r in records} == {result['action_id']}
+    assert records[-1]['mapping']['120'] == '1120'
+    assert records[-1]['outcomes']['120'] == 'completed'
+
+
+@pytest.mark.parametrize('name', ['list_messages', 'search_messages'])
+def test_search_fetches_only_slice_once(name):
+    client = BatchIMAP()
+    result = mail.call(name, {'folder': 'INBOX', 'limit': 3}, factory=lambda: client)
+    assert [m['uid'] for m in result['messages']] == ['118', '119', '120']
+    assert [c[0] for c in client.commands] == ['SELECT', 'SEARCH', 'FETCH']
+    assert client.commands[-1][1] == '118,119,120'
+
+
+@pytest.mark.parametrize('name,target,command', [('move_messages', 'Folders/Test', 'MOVE'),
+    ('add_labels', 'Labels/Test', 'COPY'), ('mark_read', '', 'STORE')])
+def test_all_cleanup_tools_batch(name, target, command, monkeypatch):
+    monkeypatch.setenv('PROTON_IMAP_CHUNK_SIZE', '40')
+    client = BatchIMAP()
+    result = mail.call(name, {**archive_args(), 'destination': target} if target else archive_args(), factory=lambda: client)
+    assert not result['uncertain']
+    assert [c[0] for c in client.commands].count(command) == 3
+    assert [c[0] for c in client.commands].count('FETCH') == 1
+    assert [c[0] for c in client.commands].count('SELECT') == 1
+
+
+def test_chunk_error_stops_and_marks_whole_chunk_uncertain(tmp_path):
+    client = BatchIMAP()
+    client.fail_chunk = 2
+    journal = ActionLog(tmp_path / 'private' / 'actions.jsonl')
+    result = mail.call('archive_messages', archive_args(), factory=lambda: client, journal=journal)
+    assert result['completed'] == client.uids[:50]
+    assert result['uncertain_uids'] == client.uids[50:100]
+    assert [c[0] for c in client.commands].count('MOVE') == 2
+    assert set(journal.recent()['entries'][-1]['outcomes'].values()) == {'uncertain'}
+
+
+def test_write_deadline_reports_completed_chunks(monkeypatch):
+    client = BatchIMAP()
+    original = client.uid
+    def slow_second(command, *args):
+        if command == 'MOVE' and any(c[0] == 'MOVE' for c in client.commands):
+            mail._local.deadline.interrupt()
+        return original(command, *args)
+    client.uid = slow_second
+    monkeypatch.setenv('PROTON_WRITE_TIMEOUT_SECONDS', '5')
+    result = mail.call('archive_messages', archive_args(), factory=lambda: client)
+    assert result['timed_out'] and result['uncertain']
+    assert result['completed_chunks'] == [0]
+    assert result['completed'] == client.uids[:50]
+    assert result['uncertain_uids'] == client.uids[50:100]
+    client.sock.shutdown.assert_called_once_with(socket.SHUT_RDWR)
+
+
+def test_write_deadline_during_preflight(monkeypatch):
+    client = BatchIMAP()
+    original = client.uid
+    def slow_fetch(*args):
+        threading.Event().wait(.04)
+        return original(*args)
+    client.uid = slow_fetch
+    monkeypatch.setenv('PROTON_WRITE_TIMEOUT_SECONDS', '.01')
+    result = mail.call('archive_messages', archive_args(), factory=lambda: client)
+    assert result['timed_out'] and result['completed_chunks'] == []
+    assert not result['uncertain']
+    assert not any(c[0] == 'MOVE' for c in client.commands)
+
+
+def test_copyuid_based_unarchive(tmp_path):
+    journal = ActionLog(tmp_path / 'private' / 'actions.jsonl')
+    archived = mail.call('archive_messages', archive_args(), factory=BatchIMAP, journal=journal)
+    client = BatchIMAP()
+    client.uids = [str(i + 1000) for i in range(1, 121)]
+    result = mail.call('unarchive_messages', {'action_id': archived['action_id']}, factory=lambda: client, journal=journal)
+    assert result['completed'] == client.uids
+    assert [c[1:] for c in client.commands if c[0] == 'SELECT'] == [('"Archive"', False)]
+    assert all(c[2] == '"INBOX"' for c in client.commands if c[0] == 'MOVE')
+    assert [c[0] for c in client.commands].count('FETCH') == 1
+    assert [c[0] for c in client.commands].count('MOVE') == 3
+
+
+@pytest.mark.parametrize('extra', [{'folder': 'All Mail'}, {'folder': 'INBOX'}, {'destination': 'Folders/Test'}, {'destination': 'Archive'}])
+def test_unarchive_rejects_other_mailboxes(extra):
+    client = BatchIMAP()
+    with pytest.raises(PublicError):
+        mail.call('unarchive_messages', {'uids': ['1'], 'uidvalidity': '1', **extra}, factory=lambda: client)
+    assert not client.commands
+
+
+def test_unarchive_explicit_and_dry_run():
+    client = BatchIMAP()
+    result = mail.call('unarchive_messages', {'uids': ['1', '2'], 'uidvalidity': '1', 'dry_run': True}, factory=lambda: client)
+    assert result['dry_run'] and not result['completed']
+    assert [c[0] for c in client.commands] == ['SELECT', 'FETCH']
+    assert client.commands[0] == ('SELECT', '"Archive"', True)
+
+
+@pytest.mark.parametrize('records', [[], [dict(status='attempting', chunk=0)],
+    [dict(status='attempting', chunk=0), dict(status='uncertain', chunk=0)]])
+def test_unarchive_refuses_missing_or_uncertain_mapping(records):
+    journal = Mock()
+    journal.action.return_value = records
+    client = BatchIMAP()
+    with pytest.raises(PublicError):
+        mail.call('unarchive_messages', {'action_id': 'synthetic-action'}, factory=lambda: client, journal=journal)
+    assert not client.commands
+
+
+def test_timing_logs_are_metadata_free(caplog):
+    client = BatchIMAP()
+    mail.call('archive_messages', archive_args(), factory=lambda: client)
+    lines = [r.message for r in caplog.records if r.message.startswith('mail_call ')]
+    assert len(lines) == 1
+    record = json.loads(lines[0].removeprefix('mail_call '))
+    assert record['requested'] == record['matched'] == 120 and record['chunks'] == 3
+    assert record['outcome'] == 'completed'
+    assert all(k in record for k in ('connect', 'login', 'select', 'search', 'fetch', 'mutate', 'audit'))
+    for secret in ('Synthetic fixture', 'sender@example.invalid', 'recipient@example.invalid', 'synthetic-id=='):
+        assert secret not in lines[0]
+
+
+@pytest.mark.parametrize('finish', [True, False])
+def test_drain_waits_for_inflight_up_to_budget(monkeypatch, finish):
+    monkeypatch.undo()
+    monkeypatch.setenv('PROTON_DRAIN_TIMEOUT_SECONDS', '.15')
+    server = mail.BoundedHTTPServer(('127.0.0.1', 0), mail.Handler)
+    assert server.mail_slot.acquire(False)
+    worker = threading.Thread(target=lambda: server.serve_forever(poll_interval=.01))
+    worker.start()
+    done = threading.Event()
+    def drain():
+        server.drain()
+        done.set()
+    draining = threading.Thread(target=drain)
+    draining.start()
+    try:
+        assert server.draining.wait(1)
+        assert not done.wait(.02)
+        if finish:
+            server.mail_slot.release()
+        assert done.wait(1)
+    finally:
+        if not finish:
+            server.mail_slot.release()
+        draining.join()
+        worker.join()
+
+
+def test_missing_preflight_uid_prevents_all_mutations():
+    client = BatchIMAP(119)
+    with pytest.raises(PublicError, match='missing'):
+        mail.call('archive_messages', archive_args(), factory=lambda: client)
+    assert not any(c[0] == 'MOVE' for c in client.commands)
+
+
+@pytest.mark.parametrize('fail_status,uncertain,moves', [('attempting', False, 0), ('completed', True, 1)])
+def test_audit_failure_stops_safely(fail_status, uncertain, moves):
+    journal = Mock()
+    def append(entry):
+        if entry['status'] == fail_status:
+            raise OSError('Synthetic unavailable log')
+    journal.append.side_effect = append
+    client = BatchIMAP()
+    result = mail.call('archive_messages', archive_args(), factory=lambda: client, journal=journal)
+    assert result['uncertain'] == uncertain
+    assert sum(c[0] == 'MOVE' for c in client.commands) == moves
+    assert not result['completed']
+
+
+def test_header_batch_handles_imap_literal_suffix_attributes():
+    client = BatchIMAP(2)
+    client.uid = Mock(return_value=('OK', [(b'1 (BODY[HEADER.FIELDS (FROM)] {5}', client.raw),
+        b' UID 2 FLAGS () RFC822.SIZE 200)', (b'2 (UID 1 FLAGS () RFC822.SIZE 200)', client.raw), b')']))
+    result = mail.Mail(client).metadata_batch('INBOX', ['1', '2'], '1')
+    assert [m['uid'] for m in result] == ['1', '2']
+
+
+def test_list_folders_still_returns_list():
+    assert isinstance(mail.call('list_folders', {}, factory=FakeIMAP), list)
+
+
+def test_read_messages_batches_preflight():
+    client = BatchIMAP(2)
+    result = mail.call('read_messages', {'messages': [dict(folder='INBOX', uid=u, uidvalidity='1') for u in client.uids]}, factory=lambda: client)
+    assert len(result['messages']) == 2
+    assert sum(c[0] == 'SELECT' for c in client.commands) == 1
+    assert sum(c[0] == 'FETCH' and 'HEADER.FIELDS' in c[2] for c in client.commands) == 1
+
+
+def test_unsubscribe_batches_preflight():
+    client = BatchIMAP(2)
+    result = mail.call('list_unsubscribe', archive_args(2), factory=lambda: client)
+    assert len(result['messages']) == 2
+    assert [c[0] for c in client.commands] == ['SELECT', 'FETCH']
+
+
+def test_copyuid_ranges_and_refuse_malformed():
+    assert mail.copy_mapping(['9 1:3 100:102'], ['1', '2', '3']) == ('9', {'1': '100', '2': '101', '3': '102'})
+    for value in ('9 1:3 100:101', '9 1:999999999 1', '9 1,1 2,3', 'bad 1 2'):
+        with pytest.raises(PublicError):
+            mail.copy_mapping([value], ['1', '2', '3'])
+
+
+def test_unarchive_refuses_partial_action_even_if_earlier_chunks_completed(tmp_path):
+    journal = ActionLog(tmp_path / 'private' / 'actions.jsonl')
+    entry = {'action_id': 'partial', 'tool': 'archive_messages', 'destination': 'Archive',
+             'chunk': 0, 'chunk_count': 2, 'uids': ['1'], 'copyuid': ['1 1 1001']}
+    for status in ('attempting', 'completed'):
+        journal.append({**entry, 'status': status})
+    with pytest.raises(PublicError, match='incomplete'):
+        mail.call('unarchive_messages', {'action_id': 'partial'}, factory=BatchIMAP, journal=journal)
+
+
+def test_unarchive_legacy_single_uid_action(tmp_path):
+    journal = ActionLog(tmp_path / 'private' / 'actions.jsonl')
+    entry = {'action_id': 'legacy', 'tool': 'archive_messages', 'destination': 'Archive', 'uids': ['1']}
+    journal.append({**entry, 'status': 'attempting'})
+    journal.append({**entry, 'status': 'completed', 'copyuid': ['1 1 1001']})
+    client = BatchIMAP(1)
+    client.uids = ['1001']
+    result = mail.call('unarchive_messages', {'action_id': 'legacy'}, factory=lambda: client, journal=journal)
+    assert result['completed'] == ['1001']

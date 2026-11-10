@@ -15,6 +15,9 @@ import re
 import ssl
 import socket
 import threading
+import time
+import signal
+from contextlib import nullcontext
 from action_log import ActionLog, PublicError
 from uuid import uuid4
 from access import configured_access
@@ -23,6 +26,121 @@ MAX_MESSAGE = 2 * 1024 * 1024
 MAX_REQUEST = 128 * 1024
 SEARCH_TIMEOUT_SECONDS = 45
 PROTOCOLS = ('2025-03-26', '2025-06-18', '2025-11-25')
+
+
+_local = threading.local()
+
+
+def setting(name, default):
+    value = float(os.environ.get(name, default))
+    if not 0 < value < 86400:
+        raise PublicError('Invalid positive service limit')
+    return value
+
+
+@contextmanager
+def phase(name):
+    start = time.monotonic()
+    try:
+        yield
+    finally:
+        metrics = getattr(_local, 'metrics', None)
+        if metrics is not None:
+            metrics[name] += time.monotonic() - start
+
+
+class WriteDeadline:
+    def __init__(self):
+        self.expired = threading.Event()
+        self.client = None
+        self.ends = time.monotonic() + setting('PROTON_WRITE_TIMEOUT_SECONDS', 120)
+        self.timer = threading.Timer(setting('PROTON_WRITE_TIMEOUT_SECONDS', 120), self.interrupt)
+        self.timer.daemon = True
+
+    def interrupt(self):
+        self.expired.set()
+        try:
+            self.client.sock.shutdown(socket.SHUT_RDWR)
+        except (OSError, AttributeError):
+            pass
+
+    def check(self):
+        if self.expired.is_set():
+            raise PublicError('Write timed out; inspect completed chunks and action history before retrying.')
+
+    def __enter__(self):
+        self.timer.start()
+        _local.deadline = self
+        return self
+
+    def __exit__(self, *args):
+        self.timer.cancel()
+        self.timer.join()
+        _local.deadline = None
+
+
+def check_deadline():
+    deadline = getattr(_local, 'deadline', None)
+    if deadline:
+        deadline.check()
+
+
+class TimedClient:
+    def __init__(self, client):
+        self.client = client
+
+    def __getattr__(self, name):
+        value = getattr(self.client, name)
+        if name not in ('select', 'uid', 'append'):
+            return value
+        def invoke(*args, **kwargs):
+            check_deadline()
+            label = 'mutate' if name == 'append' else 'select' if name == 'select' else {
+                'SEARCH': 'search', 'FETCH': 'fetch'}.get(args[0], 'mutate')
+            with phase(label):
+                result = value(*args, **kwargs)
+            check_deadline()
+            return result
+        return invoke
+
+
+class TimedJournal:
+    def __init__(self, journal):
+        self.journal = journal
+
+    def append(self, entry):
+        with phase('audit'):
+            return self.journal.append(entry)
+
+    def __getattr__(self, name):
+        return getattr(self.journal, name)
+
+
+def expand_uid_set(value):
+    result = []
+    for part in value.split(','):
+        bounds = part.split(':')
+        if len(bounds) > 2 or any(not re.fullmatch(r'[1-9][0-9]{0,9}', b) for b in bounds):
+            raise PublicError('Invalid COPYUID mapping')
+        first, last = int(bounds[0]), int(bounds[-1])
+        if abs(last - first) > 200 or len(result) + abs(last - first) + 1 > 200:
+            raise PublicError('COPYUID mapping exceeds call limit')
+        result.extend(str(n) for n in range(first, last + (1 if last >= first else -1), 1 if last >= first else -1))
+    if len(set(result)) != len(result):
+        raise PublicError('Duplicate COPYUID mapping')
+    return result
+
+
+def copy_mapping(values, expected):
+    if len(values) != 1:
+        raise PublicError('Archive COPYUID unavailable; use explicit Archive identities')
+    parts = values[0].split()
+    if len(parts) != 3 or not re.fullmatch(r'[1-9][0-9]{0,9}', parts[0]):
+        raise PublicError('Invalid COPYUID mapping')
+    source, target = expand_uid_set(parts[1]), expand_uid_set(parts[2])
+    if set(source) != set(expected) or len(source) != len(target):
+        raise PublicError('Incomplete COPYUID mapping')
+    return parts[0], dict(zip(source, target))
 
 
 def text(value, maximum=512):
@@ -80,13 +198,11 @@ def search_deadline(client):
             yield
         except TimeoutError:
             if not expired.is_set():
-                logging.warning('Mail search IMAP read timed out')
                 raise PublicError('Mail search timed out waiting for Bridge. Use INBOX or a narrower folder/date range.') from None
         except Exception:
             if not expired.is_set():
                 raise
         if expired.is_set():
-            logging.warning('Mail search exceeded its %ss deadline; IMAP transport interrupted', SEARCH_TIMEOUT_SECONDS)
             raise PublicError('Mail search timed out after ' + str(SEARCH_TIMEOUT_SECONDS)
                               + 's. Use INBOX or a narrower folder/date range; All Mail may scan the whole mailbox.')
     finally:
@@ -114,8 +230,8 @@ class Mail:
             folders.append({'name': name, 'flags': match[1].decode('ascii').split()})
         return folders
 
-    def select(self, folder, validity=None):
-        ok(self.client.select(quote(folder), readonly=True))  # Reads always EXAMINE; cleanup has its own SELECT.
+    def select(self, folder, validity=None, readonly=True):
+        ok(self.client.select(quote(folder), readonly=readonly))  # Reads always EXAMINE; cleanup has its own SELECT.
         _, data = self.client.response('UIDVALIDITY')
         current = data[0].decode('ascii') if data and data[0] else None
         if current is None or (validity is not None and current != validity):
@@ -127,16 +243,41 @@ class Mail:
 
     def metadata(self, folder, uid, uidvalidity):
         self.select(folder, uidvalidity)
-        data = ok(self.client.uid('FETCH', uid,
+        return self.metadata_batch(folder, [uid], uidvalidity)[0]
+
+    def metadata_batch(self, folder, uids, uidvalidity):
+        if not uids:
+            return []
+        data = ok(self.client.uid('FETCH', ','.join(uids),
                   '(UID FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS (' + self.HEADER_FIELDS + ')]<0.65537>)'))
-        tuples = [row for row in data if isinstance(row, tuple)]
-        if len(tuples) != 1 or len(tuples[0][1]) > 65536:
-            raise PublicError('Message missing or headers too large')
-        attributes, raw = tuples[0]
-        attributes += b' ' + b' '.join(row for row in data if isinstance(row, bytes))
-        identity = re.search(rb'UID (\d+)', attributes)
-        if not identity or identity[1].decode() != uid:
-            raise PublicError('Unexpected message identity')
+        found = {}
+        for index, row in enumerate(data):
+            if not isinstance(row, tuple):
+                continue
+            attributes, raw = row
+            if len(raw) > 65536:
+                raise PublicError('Headers too large')
+            # imaplib may return attributes following a literal as separate bytes.
+            for tail in data[index + 1:]:
+                if isinstance(tail, tuple):
+                    break
+                if isinstance(tail, bytes):
+                    attributes += b' ' + tail
+            identity = re.search(rb'UID (\d+)', attributes)
+            if not identity or identity[1].decode() not in uids or identity[1].decode() in found:
+                raise PublicError('Unexpected message identity')
+            uid = identity[1].decode()
+            found[uid] = self.parse_metadata(folder, uid, uidvalidity, attributes, raw)
+        if set(found) != set(uids):
+            raise PublicError('Message missing; search again')
+        metrics = getattr(_local, 'metrics', None)
+        if metrics is not None:
+            metrics['matched'] += len(found)
+            if not metrics['requested']:
+                metrics['requested'] = len(uids)
+        return [found[uid] for uid in uids]
+
+    def parse_metadata(self, folder, uid, uidvalidity, attributes, raw):
         flags = re.search(rb'FLAGS \(([^)]*)\)', attributes)
         size = re.search(rb'RFC822.SIZE (\d+)', attributes)
         if not flags or not size:
@@ -180,11 +321,11 @@ class Mail:
             terms.append('UNSEEN')
         uids = ok(self.client.uid('SEARCH', None, '(' + ' '.join(terms) + ')' if terms else 'ALL'))[0].split()
         return {'uidvalidity': validity,
-                'messages': [self.metadata(folder, u.decode(), validity) for u in uids[-limit:]],
+                'messages': self.metadata_batch(folder, [u.decode() for u in uids[-limit:]], validity),
                 'truncated': len(uids) > limit}
 
-    def message(self, journal, folder, uid, uidvalidity):
-        metadata = self.metadata(folder, uid, uidvalidity)
+    def message(self, journal, folder, uid, uidvalidity, metadata=None):
+        metadata = metadata or self.metadata(folder, uid, uidvalidity)
         if metadata['size'] > MAX_MESSAGE:
             raise PublicError('Message exceeds 2 MiB read limit')
         entry = {'action_id': str(uuid4()), 'tool': 'read_messages', 'folder': folder,
@@ -212,7 +353,17 @@ class Mail:
             raise
 
     def read_messages(self, journal, messages):
-        return {'messages': [self.message(journal, **ref) for ref in messages]}
+        groups = {}
+        for ref in messages:
+            groups.setdefault((ref['folder'], ref['uidvalidity']), []).append(ref)
+        results = {}
+        for (folder, validity), refs in groups.items():
+            self.select(folder, validity)
+            items = self.metadata_batch(folder, sorted({r['uid'] for r in refs}, key=int), validity)
+            for item in items:
+                results[(folder, validity, item['uid'])] = self.message(
+                    journal, folder, item['uid'], validity, item)
+        return {'messages': [results[(r['folder'], r['uidvalidity'], r['uid'])] for r in messages]}
 
     @staticmethod
     def render(message):
@@ -239,79 +390,121 @@ class Mail:
         if flags & {'\\trash', '\\junk', '\\drafts', '\\sent', '\\flagged', '\\all', '\\noselect'}:
             raise PublicError('Forbidden destination')
         valid = ((tool_name == 'archive_messages' and target == 'Archive') or
+                 (tool_name == 'unarchive_messages' and target == 'INBOX') or
                  (tool_name == 'move_messages' and target.startswith('Folders/')) or
                  (tool_name == 'add_labels' and target.startswith('Labels/')))
         if not valid or any(part.casefold() in ('trash', 'spam', 'junk', 'starred', 'drafts', 'sent', 'all mail')
                             for part in target.split('/')):
             raise PublicError('Forbidden destination')
-        if tool_name in ('archive_messages', 'move_messages') and b'MOVE' not in self.client.capabilities:
+        if tool_name in ('archive_messages', 'unarchive_messages', 'move_messages') and b'MOVE' not in self.client.capabilities:
             raise PublicError('Bridge lacks RFC 6851 MOVE; moves disabled, no fallback')
         return target
 
     def unsubscribe(self, folder, uidvalidity, uids):
+        self.select(folder, uidvalidity)
         return {'messages': [{'uid': item['uid'], 'folder': folder, 'uidvalidity': uidvalidity,
                               'subject': item['headers']['Subject'], 'sender': item['headers']['From'],
                               'List-Unsubscribe': item['headers']['List-Unsubscribe'],
                               'List-Unsubscribe-Post': item['headers']['List-Unsubscribe-Post']}
-                             for item in (self.metadata(folder, uid, uidvalidity) for uid in sorted(set(uids), key=int))],
+                             for item in self.metadata_batch(folder, sorted(set(uids), key=int), uidvalidity)],
                 'handling': 'Manual only; no links opened, HTTP requests or mail sent.'}
+
+    def unarchive(self, journal, folder='Archive', uidvalidity=None, uids=None,
+                  action_id=None, destination='INBOX', dry_run=False):
+        if folder != 'Archive' or destination != 'INBOX':
+            raise PublicError('Unarchive requires Archive source and INBOX destination')
+        if action_id:
+            if uids is not None or uidvalidity is not None:
+                raise PublicError('Use either action_id or explicit Archive identities')
+            records = journal.action(action_id)
+            intents = {r.get('chunk', 0): r for r in records if r.get('status') == 'attempting'}
+            results = {r.get('chunk', 0): r for r in records if r.get('status') == 'completed'}
+            expected_chunks = set(range(next(iter(intents.values())).get('chunk_count', 1))) if intents else set()
+            if not intents or set(intents) != expected_chunks or set(intents) != set(results) or any(
+                    r.get('tool') != 'archive_messages' or r.get('destination') != 'Archive'
+                    or r.get('status') == 'uncertain' for r in records):
+                raise PublicError('Archive action incomplete or uncertain; use explicit Archive identities')
+            uids = []
+            validities = set()
+            for record in results.values():
+                validity, mapping = copy_mapping(record.get('copyuid', []), record['uids'])
+                validities.add(validity)
+                uids.extend(mapping.values())
+            if len(validities) != 1 or len(uids) > 200 or len(set(uids)) != len(uids):
+                raise PublicError('Inconsistent Archive identities')
+            uidvalidity = validities.pop()
+        if not uids or not uidvalidity:
+            raise PublicError('Provide Archive UIDs and UIDVALIDITY or archive action_id')
+        return self.cleanup(journal, 'unarchive_messages', folder, uidvalidity, uids, destination, dry_run)
 
     def cleanup(self, journal, tool_name, folder, uidvalidity, uids, destination='', dry_run=False):
         if tool_name == 'archive_messages':
             destination = 'Archive'
+        if folder == 'All Mail' and tool_name in ('archive_messages', 'unarchive_messages', 'move_messages'):
+            raise PublicError('Moves from All Mail are forbidden; use a concrete mailbox')
         target = self.destination(tool_name, destination)
-        # Preflight EVERY explicit identity before any mutations. Missing UIDs fail closed.
-        messages = [self.metadata(folder, uid, uidvalidity) for uid in sorted(set(uids), key=int)]
+        self.select(folder, uidvalidity, readonly=dry_run)
+        uids = sorted(set(uids), key=int)
+        messages = self.metadata_batch(folder, uids, uidvalidity)
         changes = [{'uids': [item['uid']], 'subject': item['headers']['Subject'],
                     'sender': item['headers']['From'], 'destination': target} for item in messages]
-        if dry_run:
-            for change in changes:
-                journal.append({'tool': tool_name, 'folder': folder, 'uidvalidity': uidvalidity,
-                                **change, 'status': 'dry_run'})
-            return {'dry_run': True, 'tool': tool_name, 'folder': folder, 'uidvalidity': uidvalidity,
-                    'changes': changes, 'note': 'Preview only; chat approval is the assistant responsibility, not enforced by this server.'}
-        ok(self.client.select(quote(folder), readonly=False))
-        _, validity = self.client.response('UIDVALIDITY')
-        if not validity or validity[0].decode() != uidvalidity:
-            raise PublicError('Mailbox changed; search again')
-        # Check existence again in the read-write selection, not just a prior EXAMINE.
-        expected = {item['uid'] for item in messages}
-        result = ok(self.client.uid('SEARCH', None, '(UID ' + ','.join(sorted(expected, key=int)) + ')'))
-        if not result or set(result[0].decode().split()) != expected:
-            raise PublicError('Messages disappeared; search again before cleanup')
+        action_id = str(uuid4())
+        configured_chunk = setting('PROTON_IMAP_CHUNK_SIZE', 50)
+        chunk_size = int(configured_chunk)
+        if chunk_size < 1 or chunk_size != configured_chunk:
+            raise PublicError('Invalid chunk size')
         completed = []
-        for change in changes:
-            uid = change['uids'][0]
-            entry = {'action_id': str(uuid4()), 'tool': tool_name, 'folder': folder,
-                     'uidvalidity': uidvalidity, **change}
-            # Durable intent BEFORE each command. If logging fails, do not perform it.
+        completed_chunks = []
+        for index, start in enumerate(range(0, len(uids), chunk_size)):
+            chunk = uids[start:start + chunk_size]
+            entry = {'action_id': action_id, 'chunk': index, 'chunk_count': (len(uids) + chunk_size - 1) // chunk_size, 'tool': tool_name, 'folder': folder,
+                     'uidvalidity': uidvalidity, 'uids': chunk, 'destination': target}
+            metrics = getattr(_local, 'metrics', None)
+            if metrics is not None:
+                metrics['chunks'] += 1
+            def stopped(uncertain, message):
+                return {'action_id': action_id, 'completed': completed, 'completed_chunks': completed_chunks,
+                        'uncertain': uncertain, 'uncertain_uids': chunk if uncertain else [],
+                        'uid': chunk[0], 'stopped': True, 'dry_run': dry_run,
+                        'timed_out': bool(getattr(_local, 'deadline', None) and _local.deadline.expired.is_set()),
+                        'message': message}
             try:
-                journal.append({**entry, 'status': 'attempting'})
+                check_deadline()
+                journal.append({**entry, 'status': 'dry_run' if dry_run else 'attempting',
+                                'outcomes': {uid: 'dry_run' if dry_run else 'attempting' for uid in chunk}})
             except Exception:
-                return {'completed': completed, 'uncertain': False, 'stopped': True, 'uid': uid,
-                        'message': 'Action log unavailable; no command attempted for this UID. Inspect earlier results before retrying.'}
+                return stopped(False, 'Deadline expired or action log unavailable; no command attempted for this chunk.')
+            if dry_run:
+                continue
             try:
-                if tool_name in ('archive_messages', 'move_messages'):
-                    ok(self.client.uid('MOVE', uid, quote(target)))
+                check_deadline()
+                uid_set = ','.join(chunk)
+                if tool_name in ('archive_messages', 'unarchive_messages', 'move_messages'):
+                    ok(self.client.uid('MOVE', uid_set, quote(target)))
                 elif tool_name == 'add_labels':
-                    # Proton maps COPY into Labels/ to adding the existing label. Never deletion.
-                    ok(self.client.uid('COPY', uid, quote(target)))
+                    ok(self.client.uid('COPY', uid_set, quote(target)))
                 elif tool_name == 'mark_read':
-                    ok(self.client.uid('STORE', uid, '+FLAGS.SILENT', '(\\Seen)'))
+                    ok(self.client.uid('STORE', uid_set, '+FLAGS.SILENT', '(\\Seen)'))
                 else:
                     raise PublicError('Unknown cleanup tool')
                 _, copied = self.client.response('COPYUID')
-                journal.append({**entry, 'status': 'completed',
-                                'copyuid': [value.decode('ascii') for value in copied if value] if copied else []})
-                completed.append(uid)
+                values = [v.decode('ascii') for v in copied if v] if copied else []
+                mapping = copy_mapping(values, chunk)[1] if values and tool_name != 'mark_read' else {}
+                journal.append({**entry, 'status': 'completed', 'copyuid': values, 'mapping': mapping,
+                                'outcomes': {uid: 'completed' for uid in chunk}})
+                completed.extend(chunk)
+                completed_chunks.append(index)
             except Exception:
                 try:
-                    journal.append({**entry, 'status': 'uncertain'})
+                    journal.append({**entry, 'status': 'uncertain',
+                                    'outcomes': {uid: 'uncertain' for uid in chunk}})
                 except Exception:
-                    pass  # The durable intent remains if the result cannot be journaled.
-                return {'completed': completed, 'uncertain': True, 'uid': uid,
-                        'message': 'Stopped after an uncertain result. Inspect mail and list_actions; never retry blindly.'}
-        return {'completed': completed, 'dry_run': False, 'uncertain': False}
+                    pass
+                return stopped(True, 'Stopped after an uncertain result or timeout. Inspect mail and list_actions; never retry blindly.')
+        return {'action_id': action_id, 'completed': completed, 'completed_chunks': completed_chunks,
+                'dry_run': dry_run, 'uncertain': False,
+                **({'tool': tool_name, 'folder': folder, 'uidvalidity': uidvalidity, 'changes': changes,
+                    'note': 'Preview only; chat approval is the assistant responsibility, not enforced by this server.'} if dry_run else {})}
 
     def draft(self, to, subject, body, cc='', in_reply_to=''):
         # Draft creation writes only to the fixed special-use Drafts target.
@@ -374,6 +567,8 @@ TOOLS = [tool('list_folders', 'HEADERS/METADATA ONLY: list folders. Never return
               {**CLEANUP, 'destination': S}, [*MESSAGES, 'destination'], False),
          tool('mark_read', 'MAILBOX WRITE: changes the mailbox by setting Seen on explicit UIDs. Ask owner first in chat/client. Supports dry_run.',
               CLEANUP, list(MESSAGES), False),
+         tool('unarchive_messages', 'MAILBOX WRITE: move only Archive to INBOX; never sends or permanently deletes. Use Archive UIDs/UIDVALIDITY or a previous archive action_id. Same dry_run default as archive.',
+              {**CLEANUP, 'action_id': S, 'destination': S}, [], False),
          tool('list_actions', 'METADATA ONLY: read recent private read/write audit records, never bodies. The history read is itself logged.',
               {'limit': {'type': 'integer', 'minimum': 1, 'maximum': 200}}, [])]
 
@@ -438,10 +633,27 @@ def connect():
     # Fixed IPv4 loopback, required STARTTLS before LOGIN, trust only exported Bridge cert.
     context = ssl.create_default_context(cafile=os.environ['PROTON_BRIDGE_CERT'])
     context.check_hostname = False  # Bridge's self-signed cert is the trust anchor.
-    client = imaplib.IMAP4('127.0.0.1', 1143, timeout=20)
+    deadline = getattr(_local, 'deadline', None)
+    class DeadlineIMAP(imaplib.IMAP4):
+        def _create_socket(self, timeout):
+            # Attach before the constructor reads Bridge's greeting/capabilities.
+            self.sock = super()._create_socket(timeout)
+            if deadline:
+                deadline.client = self
+                if deadline.expired.is_set():
+                    self.sock.close()
+                    deadline.check()
+            return self.sock
+    timeout = min(20, max(.001, deadline.ends - time.monotonic())) if deadline else 20
+    client = DeadlineIMAP('127.0.0.1', 1143, timeout=timeout)
     try:
+        deadline = getattr(_local, 'deadline', None)
+        if deadline:
+            deadline.client = client
+            deadline.check()
         client.starttls(context)
-        client.login(username, password)
+        with phase('login'):
+            client.login(username, password)
         client.bridge_username = username
         # Gluon advertises MOVE only AFTER authentication; imaplib's cached
         # pre-login capabilities are insufficient for the cleanup gate.
@@ -464,15 +676,22 @@ def audit_headers(journal, name, result, folder=None):
                         'sender': headers.get('From', item.get('sender')), 'destination': None, 'status': 'completed'})
 
 
-def call(name, args, factory=connect, journal=None):
+def _call(name, args, factory=connect, journal=None):
     validate(name, args)
-    journal = journal or ActionLog(os.environ.get('PROTON_ACTION_LOG', '/var/lib/proton-mail/actions/actions.jsonl'))
+    journal = TimedJournal(journal or ActionLog(os.environ.get('PROTON_ACTION_LOG', '/var/lib/proton-mail/actions/actions.jsonl')))
     if name == 'list_actions':
         result = journal.recent(**args)
         audit_headers(journal, name, result)
         return result
-    client = factory()
+    login_before = _local.metrics['login']
+    with phase('connect'):
+        client = TimedClient(factory())
+    _local.metrics['connect'] -= _local.metrics['login'] - login_before
+    deadline = getattr(_local, 'deadline', None)
+    if deadline:
+        deadline.client = client
     try:
+        check_deadline()
         mail = Mail(client, client.bridge_username)
         if name == 'list_folders':
             result = mail.folders()
@@ -484,6 +703,8 @@ def call(name, args, factory=connect, journal=None):
             return mail.read_messages(journal, **args)
         elif name in ('archive_messages', 'move_messages', 'add_labels', 'mark_read'):
             return mail.cleanup(journal, name, **args)
+        elif name == 'unarchive_messages':
+            return mail.unarchive(journal, **args)
         elif name == 'create_draft':
             entry = {'action_id': str(uuid4()), 'tool': name, 'folder': 'Drafts', 'uids': [],
                      'subject': args['subject'], 'sender': client.bridge_username,
@@ -515,14 +736,73 @@ def call(name, args, factory=connect, journal=None):
                 pass
 
 
+def call(name, args, factory=connect, journal=None):
+    metrics = dict.fromkeys(('connect', 'login', 'select', 'search', 'fetch', 'mutate', 'audit',
+                             'requested', 'matched', 'chunks'), 0)
+    _local.metrics = metrics
+    outcome = 'error'
+    try:
+        validate(name, args)
+        metrics['requested'] = len(args.get('uids', args.get('messages', [])))
+        write = name in ('archive_messages', 'unarchive_messages', 'move_messages', 'add_labels', 'mark_read', 'create_draft')
+        with WriteDeadline() if write else nullcontext():
+            try:
+                result = _call(name, args, factory, journal)
+            except Exception:
+                deadline = getattr(_local, 'deadline', None)
+                if deadline and deadline.expired.is_set():
+                    result = {'timed_out': True, 'completed': [], 'completed_chunks': [],
+                              'uncertain': name == 'create_draft', 'stopped': True,
+                              'message': ('Write timed out; inspect Drafts and action history before retrying.'
+                                          if name == 'create_draft' else 'Write timed out before mutations; no chunks completed.')}
+                else:
+                    raise
+            outcome = 'completed'
+            if isinstance(result, dict):
+                for key, label in (('stopped', 'stopped'), ('uncertain', 'uncertain'), ('timed_out', 'timeout')):
+                    if result.get(key):
+                        outcome = label
+            return result
+    except PublicError as error:
+        if 'timed out' in str(error):
+            outcome = 'timeout'
+        raise
+    finally:
+        # Only allowlisted fields and tool names; never serialize arguments/exceptions.
+        safe_name = name if isinstance(name, str) and name in {t['name'] for t in TOOLS} else 'unknown'
+        logging.warning('mail_call %s', json.dumps({'tool': safe_name, 'outcome': outcome,
+                        **{k: round(v, 6) for k, v in metrics.items()}}))
+        _local.metrics = None
+
+
 class BoundedHTTPServer(http.server.ThreadingHTTPServer):
     """Keep HTTP responsive without admitting parallel mail operations."""
     daemon_threads = True
 
     def __init__(self, *args, **kwargs):
+        self.draining = threading.Event()
+        self.drain_done = threading.Event()
         self.mail_slot = threading.BoundedSemaphore(1)
         self._http_slots = threading.BoundedSemaphore(8)
+        self._requests = threading.Condition()
+        self._active_requests = 0
         super().__init__(*args, **kwargs)
+
+    def drain(self):
+        self.draining.set()
+        end = time.monotonic() + setting('PROTON_DRAIN_TIMEOUT_SECONDS', 60)
+        try:
+            self.shutdown()
+            acquired = self.mail_slot.acquire(timeout=max(0, end - time.monotonic()))
+            if acquired:
+                self.mail_slot.release()
+            with self._requests:
+                finished = self._requests.wait_for(lambda: self._active_requests == 0,
+                                                   timeout=max(0, end - time.monotonic()))
+            self.server_close()
+            return acquired and finished
+        finally:
+            self.drain_done.set()
 
     def process_request(self, request, client_address):
         if not self._http_slots.acquire(blocking=False):
@@ -536,10 +816,15 @@ class BoundedHTTPServer(http.server.ThreadingHTTPServer):
             finally:
                 self.shutdown_request(request)
             return
+        with self._requests:
+            self._active_requests += 1
         try:
             super().process_request(request, client_address)
         except BaseException:
             self._http_slots.release()
+            with self._requests:
+                self._active_requests -= 1
+                self._requests.notify_all()
             raise
 
     def process_request_thread(self, request, client_address):
@@ -547,6 +832,9 @@ class BoundedHTTPServer(http.server.ThreadingHTTPServer):
             super().process_request_thread(request, client_address)
         finally:
             self._http_slots.release()
+            with self._requests:
+                self._active_requests -= 1
+                self._requests.notify_all()
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -640,6 +928,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 if not self.server.mail_slot.acquire(blocking=False):
                     raise PublicError('Mail service busy; retry serially after the current call finishes.')
                 try:
+                    if self.server.draining.is_set():
+                        raise PublicError('Mail service shutting down; new calls refused.')
                     value = call(params.get('name'), params.get('arguments', {}))
                 finally:
                     self.server.mail_slot.release()
@@ -664,6 +954,14 @@ def create_server():
 
 if __name__ == '__main__':
     try:
-        create_server().serve_forever()
+        server = create_server()
+        def terminate(*_):
+            if server.draining.is_set():
+                return
+            server.draining.set()
+            threading.Thread(target=server.drain, daemon=True).start()
+        signal.signal(signal.SIGTERM, terminate)
+        server.serve_forever()
+        server.drain_done.wait()
     except RuntimeError as error:
         raise SystemExit(str(error)) from None

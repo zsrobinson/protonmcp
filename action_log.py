@@ -61,3 +61,20 @@ class ActionLog:
                 malformed = True
         return {'entries': entries, 'truncated': bool(start or len(lines) > limit),
                 'incompleteLog': malformed}
+
+    def action(self, action_id):
+        """Find one call's durable chunk records without truncating recent history."""
+        try:
+            stream = self._open()
+        except FileNotFoundError:
+            return []
+        entries = []
+        with stream:
+            for line in stream:
+                try:
+                    record = json.loads(line)
+                except (ValueError, UnicodeError):
+                    continue
+                if record.get('action_id') == action_id:
+                    entries.append(record)
+        return entries
