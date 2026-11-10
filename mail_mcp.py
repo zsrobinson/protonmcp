@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Local MCP: separate header/body tools and logged cleanup, draft APPEND."""
 import email.policy
+import datetime
+from email.header import decode_header, make_header
 from contextlib import contextmanager
 from email.parser import BytesParser
 from email.message import EmailMessage
@@ -25,6 +27,9 @@ from access import configured_access
 MAX_MESSAGE = 2 * 1024 * 1024
 MAX_REQUEST = 128 * 1024
 SEARCH_TIMEOUT_SECONDS = 45
+SEARCH_SCAN_SECONDS = 30
+SEARCH_SCAN_MAX = 5000
+SEARCH_PAGE_SIZE = 200
 PROTOCOLS = ('2025-03-26', '2025-06-18', '2025-11-25')
 
 
@@ -204,10 +209,72 @@ def search_deadline(client):
                 raise
         if expired.is_set():
             raise PublicError('Mail search timed out after ' + str(SEARCH_TIMEOUT_SECONDS)
-                              + 's. Use INBOX or a narrower folder/date range; All Mail may scan the whole mailbox.')
+                              + 's. Use INBOX or a narrower folder/date range.')
     finally:
         timer.cancel()
         timer.join()  # No watchdog survives the operation or races the next call.
+
+
+def envelope_values(data):
+    """Parse nested IMAP values, including imaplib's split literal responses."""
+    chunks = []
+    for row in data:
+        if isinstance(row, tuple):
+            prefix, literal = row
+            prefix = re.sub(rb'\{[0-9]+\}$', b'', prefix)
+            chunks.append(prefix + b'"' + literal.replace(b'\\', b'\\\\').replace(b'"', b'\\"') + b'"')
+        elif isinstance(row, bytes):
+            chunks.append(row)
+    raw = b' '.join(chunks)
+    tokens = re.findall(rb'"(?:[^"\\]|\\.)*"|[()]|[^\s()]+', raw)
+    index = 0
+
+    def value():
+        nonlocal index
+        if index >= len(tokens):
+            raise PublicError('Invalid envelope response')
+        token = tokens[index]
+        index += 1
+        if token == b'(':
+            result = []
+            while index < len(tokens) and tokens[index] != b')':
+                result.append(value())
+            if index == len(tokens):
+                raise PublicError('Invalid envelope response')
+            index += 1
+            return result
+        if token == b')':
+            raise PublicError('Invalid envelope response')
+        if token.startswith(b'"'):
+            return re.sub(rb'\\(.)', rb'\1', token[1:-1]).decode('utf-8', 'replace')
+        return None if token.upper() == b'NIL' else token.decode('ascii')
+
+    result = {}
+    while index < len(tokens):
+        value()  # Sequence number; identities always come from UID.
+        attrs = value()
+        if not isinstance(attrs, list) or len(attrs) % 2:
+            raise PublicError('Invalid envelope response')
+        attrs = dict(zip(attrs[::2], attrs[1::2]))
+        uid = attrs.get('UID')
+        if not uid or uid in result or not isinstance(attrs.get('ENVELOPE'), list) or len(attrs['ENVELOPE']) != 10:
+            raise PublicError('Invalid envelope response')
+        result[uid] = attrs
+    return result
+
+
+def decoded(value):
+    try:
+        return str(make_header(decode_header(value or ''))).casefold()
+    except (LookupError, UnicodeError):
+        return (value or '').casefold()
+
+
+def envelope_address(addresses):
+    if not addresses:
+        return ''
+    return ' '.join(decoded(a[0]) + ' ' + decoded((a[2] or '') + '@' + (a[3] or ''))
+                    for a in addresses if isinstance(a, list) and len(a) == 4)
 
 
 class Mail:
@@ -309,20 +376,59 @@ class Mail:
             raise PublicError('All Mail searches require since and before; use a short date range or a narrower folder.')
         validity = self.select(folder)
         terms = []
-        for key, value in [('FROM', sender), ('SUBJECT', subject), ('SINCE', since), ('BEFORE', before)]:
+        for key, value in [('SINCE', since), ('BEFORE', before)]:
             if value:
-                if key in ('SINCE', 'BEFORE'):
-                    import datetime
-                    datetime.datetime.strptime(value, '%d-%b-%Y')
+                datetime.datetime.strptime(value, '%d-%b-%Y')
                 terms.extend([key, quote(value)])
-        if recipient:
-            terms.append('(OR TO ' + quote(recipient) + ' CC ' + quote(recipient) + ')')
+        for value in (sender, recipient, subject):
+            text(value)  # Keep control-character and length validation for local filters.
         if unread:
             terms.append('UNSEEN')
-        uids = ok(self.client.uid('SEARCH', None, '(' + ' '.join(terms) + ')' if terms else 'ALL'))[0].split()
+        uids = [u.decode('ascii') for u in ok(self.client.uid(
+            'SEARCH', None, '(' + ' '.join(terms) + ')' if terms else 'ALL'))[0].split()]
+        filtered = bool(sender or recipient or subject)
+        stats = {'candidates': len(uids), 'scanned': 0, 'pages': 0, 'complete': True}
+        oldest = None
+        chosen = uids[-limit:]
+        if filtered:
+            chosen = []
+            start = time.monotonic()
+            newest = sorted(uids, key=int, reverse=True)
+            for offset in range(0, len(newest), SEARCH_PAGE_SIZE):
+                if stats['scanned'] >= SEARCH_SCAN_MAX or time.monotonic() - start >= SEARCH_SCAN_SECONDS:
+                    stats['complete'] = False
+                    break
+                page = newest[offset:offset + min(SEARCH_PAGE_SIZE, SEARCH_SCAN_MAX - stats['scanned'])]
+                envelopes = envelope_values(ok(self.client.uid('FETCH', ','.join(page), '(UID ENVELOPE INTERNALDATE)')))
+                if set(envelopes) != set(page):
+                    raise PublicError('Message missing; search again')
+                stats['pages'] += 1
+                for uid in page:
+                    attrs = envelopes[uid]
+                    env = attrs['ENVELOPE']
+                    stats['scanned'] += 1
+                    date = attrs.get('INTERNALDATE')
+                    if date:
+                        parsed = datetime.datetime.strptime(date, '%d-%b-%Y %H:%M:%S %z').date().isoformat()
+                        oldest = min(oldest, parsed) if oldest else parsed
+                    if (not sender or sender.casefold() in envelope_address(env[2])) and (
+                        not recipient or recipient.casefold() in envelope_address((env[5] or []) + (env[6] or []))) and (
+                        not subject or subject.casefold() in decoded(env[1])):
+                        chosen.append(uid)
+                        if len(chosen) == limit:
+                            break
+                if len(chosen) == limit:
+                    break
+                if stats['scanned'] >= SEARCH_SCAN_MAX and stats['scanned'] < len(newest):
+                    stats['complete'] = False
+                    break
+        metrics = getattr(_local, 'metrics', None)
+        if metrics is not None:
+            metrics.update(stats)
         return {'uidvalidity': validity,
-                'messages': self.metadata_batch(folder, [u.decode() for u in uids[-limit:]], validity),
-                'truncated': len(uids) > limit}
+                'messages': self.metadata_batch(folder, chosen, validity),
+                'truncated': (len(uids) > limit if not filtered else len(chosen) == limit or not stats['complete']),
+                **stats, 'oldest_scanned_date': oldest}
 
     def message(self, journal, folder, uid, uidvalidity, metadata=None):
         metadata = metadata or self.metadata(folder, uid, uidvalidity)
@@ -573,6 +679,14 @@ TOOLS = [tool('list_folders', 'HEADERS/METADATA ONLY: list folders. Never return
               {'limit': {'type': 'integer', 'minimum': 1, 'maximum': 200}}, [])]
 
 
+for _tool in TOOLS:
+    if _tool['name'] in ('list_messages', 'search_messages'):
+        _tool['description'] += (' Header filters scan metadata envelopes newest-first, stopping at 5000 candidates or a 30-second check between pages. '
+                                 'complete=false means partial results: narrow since/before or folder. '
+                                 'scanned/candidates/pages and oldest_scanned_date describe coverage; '
+                                 'complete=true means enough matches were found or all candidates were checked.')
+
+
 def validate(name, args):
     schema = next((t['inputSchema'] for t in TOOLS if t['name'] == name), None)
     if schema is None or not isinstance(args, dict) or set(args) - schema['properties'].keys() or any(k not in args for k in schema['required']):
@@ -629,9 +743,11 @@ def read_credentials():
 
 
 def connect():
-    username, password = read_credentials()
+    with phase('credentials'):
+        username, password = read_credentials()
     # Fixed IPv4 loopback, required STARTTLS before LOGIN, trust only exported Bridge cert.
-    context = ssl.create_default_context(cafile=os.environ['PROTON_BRIDGE_CERT'])
+    with phase('tls_context'):
+        context = ssl.create_default_context(cafile=os.environ['PROTON_BRIDGE_CERT'])
     context.check_hostname = False  # Bridge's self-signed cert is the trust anchor.
     deadline = getattr(_local, 'deadline', None)
     class DeadlineIMAP(imaplib.IMAP4):
@@ -645,19 +761,22 @@ def connect():
                     deadline.check()
             return self.sock
     timeout = min(20, max(.001, deadline.ends - time.monotonic())) if deadline else 20
-    client = DeadlineIMAP('127.0.0.1', 1143, timeout=timeout)
+    with phase('tcp_greeting'):
+        client = DeadlineIMAP('127.0.0.1', 1143, timeout=timeout)
     try:
         deadline = getattr(_local, 'deadline', None)
         if deadline:
             deadline.client = client
             deadline.check()
-        client.starttls(context)
+        with phase('starttls'):
+            client.starttls(context)
         with phase('login'):
             client.login(username, password)
         client.bridge_username = username
         # Gluon advertises MOVE only AFTER authentication; imaplib's cached
         # pre-login capabilities are insufficient for the cleanup gate.
-        capabilities = ok(client.capability())
+        with phase('capability'):
+            capabilities = ok(client.capability())
         client.capabilities = tuple(capabilities[0].upper().split())
         return client
     except Exception:
@@ -736,9 +855,33 @@ def _call(name, args, factory=connect, journal=None):
                 pass
 
 
+PHASES = ('connect', 'credentials', 'tls_context', 'tcp_greeting', 'starttls',
+          'capability', 'login', 'select', 'search', 'fetch', 'mutate', 'audit')
+COUNTS = ('requested', 'matched', 'chunks', 'candidates', 'scanned', 'pages')
+
+
+def new_metrics():
+    return {**dict.fromkeys(PHASES + COUNTS, 0), 'complete': None}
+
+
+def call_record(name, metrics, started, outcome, error_class, req_bytes, resp_bytes):
+    safe_name = name if isinstance(name, str) and name in {t['name'] for t in TOOLS} else 'unknown'
+    return {'v': 1, 'ts': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            'tool': safe_name, 'total_ms': round((time.monotonic() - started) * 1000, 3),
+            'outcome': outcome, 'error_class': error_class, 'req_bytes': req_bytes, 'resp_bytes': resp_bytes,
+            'phase': {k: round(metrics[k] * 1000, 3) for k in PHASES},
+            **{k: metrics[k] for k in COUNTS}, 'complete': metrics['complete']}
+
+
+def log_call(record):
+    logging.warning('mail_call %s', json.dumps(record))
+
+
 def call(name, args, factory=connect, journal=None):
-    metrics = dict.fromkeys(('connect', 'login', 'select', 'search', 'fetch', 'mutate', 'audit',
-                             'requested', 'matched', 'chunks'), 0)
+    started = time.monotonic()
+    metrics = new_metrics()
+    error_class = None
+    result = None
     _local.metrics = metrics
     outcome = 'error'
     try:
@@ -757,21 +900,31 @@ def call(name, args, factory=connect, journal=None):
                                           if name == 'create_draft' else 'Write timed out before mutations; no chunks completed.')}
                 else:
                     raise
-            outcome = 'completed'
+            outcome = 'ok'
             if isinstance(result, dict):
-                for key, label in (('stopped', 'stopped'), ('uncertain', 'uncertain'), ('timed_out', 'timeout')):
+                for key, label in (('stopped', 'tool_error'), ('uncertain', 'tool_error'), ('timed_out', 'timeout')):
                     if result.get(key):
                         outcome = label
+            if outcome != 'ok':
+                error_class = 'deadline' if outcome == 'timeout' else 'stopped'
             return result
     except PublicError as error:
-        if 'timed out' in str(error):
+        outcome = 'timeout' if 'timed out' in str(error) else 'tool_error'
+        error_class = 'deadline' if outcome == 'timeout' else 'PublicError'
+        raise
+    except Exception as error:
+        error_class = type(error).__name__ if type(error) in (TimeoutError, OSError, ValueError, RuntimeError) else 'internal'
+        if isinstance(error, TimeoutError):
             outcome = 'timeout'
         raise
     finally:
-        # Only allowlisted fields and tool names; never serialize arguments/exceptions.
-        safe_name = name if isinstance(name, str) and name in {t['name'] for t in TOOLS} else 'unknown'
-        logging.warning('mail_call %s', json.dumps({'tool': safe_name, 'outcome': outcome,
-                        **{k: round(v, 6) for k, v in metrics.items()}}))
+        record = call_record(name, metrics, started, outcome, error_class,
+                             len(json.dumps(args).encode()),
+                             len(json.dumps(result).encode()) if result is not None else 0)
+        if getattr(_local, 'transport', None) is not None:
+            _local.transport['record'] = record
+        else:
+            log_call(record)
         _local.metrics = None
 
 
@@ -916,7 +1069,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if method == 'initialize':
             proposed = params.get('protocolVersion')
             result = {'protocolVersion': proposed if proposed in PROTOCOLS else PROTOCOLS[-1],
-                      'capabilities': {'tools': {}}, 'serverInfo': {'name': 'fleet-proton-mail', 'version': '1.0.0'}}
+                      'capabilities': {'tools': {}}, 'serverInfo': {'name': 'fleet-proton-mail', 'version': '0.3.0'}}
         elif self.headers.get('MCP-Protocol-Version', PROTOCOLS[0]) not in PROTOCOLS:
             return self.reply(400)
         elif method == 'ping':
@@ -924,11 +1077,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif method == 'tools/list':
             result = {'tools': TOOLS}
         elif method == 'tools/call':
+            _local.transport = {'started': time.monotonic(), 'record': None}
+            refusal_code = None
             try:
                 if not self.server.mail_slot.acquire(blocking=False):
+                    refusal_code = 'busy'
                     raise PublicError('Mail service busy; retry serially after the current call finishes.')
                 try:
                     if self.server.draining.is_set():
+                        refusal_code = 'draining'
                         raise PublicError('Mail service shutting down; new calls refused.')
                     value = call(params.get('name'), params.get('arguments', {}))
                 finally:
@@ -940,7 +1097,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 result = {'isError': True, 'content': [{'type': 'text', 'text': 'Mail operation failed. Check configuration or limits. For a draft, inspect Drafts before retrying.'}]}
         else:
             error = {'code': -32601, 'message': 'Method not found'}
-        self.reply(200, {'jsonrpc': '2.0', 'id': ident, **({'error': error} if error else {'result': result})})
+        response = {'jsonrpc': '2.0', 'id': ident, **({'error': error} if error else {'result': result})}
+        if method == 'tools/call':
+            transport = _local.transport
+            record = transport['record'] or call_record(params.get('name'), new_metrics(),
+                transport['started'], 'refused', refusal_code or 'internal', length, 0)
+            record.update(req_bytes=length, resp_bytes=len(json.dumps(response).encode()),
+                          total_ms=round((time.monotonic() - transport['started']) * 1000, 3))
+            log_call(record)
+            _local.transport = None
+        self.reply(200, response)
 
 
 def create_server():

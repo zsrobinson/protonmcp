@@ -101,12 +101,43 @@ archive. Moves from All Mail are refused. Moves require MOVE capability and neve
 fall back to COPY, Deleted flags or EXPUNGE. The server never sends mail and
 never permanently deletes mail.
 
-Each tool call emits one JSON timing line to stderr/journal with an allowlisted
-tool name, phase seconds (`connect`, `login`, `select`, `search`, `fetch`, `mutate`,
-`audit`), requested/matched UID and chunk counts, and outcome. Connection time
-includes TLS; login is measured separately. Folder names, header values, message
-IDs and bodies are excluded entirely. Private action history still contains
-mailbox identities and may contain subjects/senders; protect it as described above.
+## Performance
+
+Listing and search first run UID SEARCH with metadata keys only (dates and
+UNSEEN, otherwise ALL). Header filters scan UID ENVELOPE and INTERNALDATE in
+pages of 200, newest UID first, matching decoded subjects and display names or
+addresses locally with case-insensitive substrings. Recipient matches To or Cc.
+No body or TEXT search is supported. Only the final matches load header fields.
+Without header filters, the existing last-`limit` UID slice and ordering remain.
+
+Scanning stops after enough matches, 5,000 candidates, or 30 seconds checked
+between pages. `complete: true` means the requested limit was filled or all
+candidates were checked; it does not promise all matching mail was returned.
+`complete: false` returns partial results: narrow `since`/`before` or the folder.
+`candidates`, `scanned`, `pages`, and `oldest_scanned_date` (an internal-date
+calendar date, or null) describe coverage. UID order is not guaranteed to follow
+message dates. A slow individual IMAP command remains subject to the existing
+45-second search watchdog. All Mail still requires both dates; limits remain 1–50.
+
+Each call emits one `mail_call` JSON line, separate from private action history:
+
+- `v: 1`, `ts` (UTC ISO), allowlisted `tool`, `total_ms` (monotonic elapsed time,
+  including connection, audit and cleanup), `outcome` (`ok`, `tool_error`, `error`,
+  `timeout`, or `refused`), and `error_class` (allowlisted name/code or null).
+- `req_bytes`/`resp_bytes`: UTF-8 JSON payload sizes. HTTP calls count the complete
+  request/response JSON; direct Python calls count arguments/result (zero response
+  bytes when an exception escapes).
+- `phase`: milliseconds for `connect`, `credentials`, `tls_context`, `tcp_greeting`
+  (including initial capability discovery), `starttls`, `capability` (authenticated),
+  `login`, `select`, `search`, `fetch`, `mutate`, and `audit`. Connect is an aggregate
+  excluding login; its subphases overlap that aggregate and must not be summed.
+- Counts: `requested`, `matched`, `chunks`, `candidates`, `scanned`, `pages`, and
+  `complete` (null for calls without search results). Busy and draining refusals
+  use the same schema, with zero phase times and counts.
+
+Arguments, folder names, addresses, subjects, UIDs, message IDs, exception messages,
+paths and bodies are excluded. Private action history still contains mailbox
+identities and may contain subjects/senders; protect it as described above.
 
 ## Development
 

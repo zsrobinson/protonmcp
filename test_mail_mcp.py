@@ -1,5 +1,7 @@
 """All mail below is generated synthetic content; no captured mail or live I/O."""
+from contextlib import contextmanager
 from email.message import EmailMessage
+from imaplib import IMAP4 as WireIMAP
 import http.client
 import json
 import socket
@@ -165,7 +167,7 @@ def test_web_url_validates_opaque_id(value):
     assert (result is not None) == (value == 'synthetic-id==')
 
 
-def test_busy_call_does_not_block_ping(monkeypatch):
+def test_busy_call_does_not_block_ping(monkeypatch, caplog):
     # Real loopback transport with mocked mail, no credential or external requests.
     monkeypatch.undo()
     started, release = threading.Event(), threading.Event()
@@ -200,6 +202,14 @@ def test_busy_call_does_not_block_ping(monkeypatch):
         server.draining.set()
         refused = request('tools/call')['result']
         assert refused['isError'] and 'shutting down' in refused['content'][0]['text']
+        records = [json.loads(r.message.removeprefix('mail_call ')) for r in caplog.records
+                   if r.message.startswith('mail_call ')]
+        refusals = [r for r in records if r['error_class'] in ('busy', 'draining')]
+        assert len(refusals) == 2
+        for record in refusals:
+            assert_telemetry(record)
+            assert record['outcome'] == 'refused'
+            assert record['req_bytes'] > 0 and record['resp_bytes'] > 0
     finally:
         release.set()
         first.join()
@@ -389,8 +399,9 @@ def test_timing_logs_are_metadata_free(caplog):
     assert len(lines) == 1
     record = json.loads(lines[0].removeprefix('mail_call '))
     assert record['requested'] == record['matched'] == 120 and record['chunks'] == 3
-    assert record['outcome'] == 'completed'
-    assert all(k in record for k in ('connect', 'login', 'select', 'search', 'fetch', 'mutate', 'audit'))
+    assert record['outcome'] == 'ok'
+    assert_telemetry(record)
+    assert all(k in record['phase'] for k in mail.PHASES)
     for secret in ('Synthetic fixture', 'sender@example.invalid', 'recipient@example.invalid', 'synthetic-id=='):
         assert secret not in lines[0]
 
@@ -496,3 +507,249 @@ def test_unarchive_legacy_single_uid_action(tmp_path):
     client.uids = ['1001']
     result = mail.call('unarchive_messages', {'action_id': 'legacy'}, factory=lambda: client, journal=journal)
     assert result['completed'] == ['1001']
+
+
+class EnvelopeIMAP(BatchIMAP):
+    def __init__(self, count=5000, matches=True):
+        super().__init__(count)
+        self.matches = matches
+        self.literal_loads = 0
+
+    def uid(self, command, *args):
+        if command == 'SEARCH':
+            # Model Gluon's literal-loading behavior for the old search.
+            if any(key in str(args) for key in ('FROM', 'SUBJECT', 'TO ', 'CC ')):
+                self.literal_loads += len(self.uids)
+        if command == 'FETCH' and 'ENVELOPE' in args[1]:
+            self.commands.append((command, *args))
+            rows = []
+            for uid in args[0].split(','):
+                subject = '=?utf-8?b?Q2Fmw6k=?=' if self.matches else 'Other'
+                rows.append((f'{uid} (UID {uid} ENVELOPE (NIL "{subject}" '
+                             '(("=?utf-8?q?Ren=C3=A9?=" NIL "sender" "example.invalid")) '
+                             'NIL NIL (("Reader" NIL "to" "example.invalid")) '
+                             '(("Copy" NIL "cc" "example.invalid")) NIL NIL NIL) '
+                             'INTERNALDATE "01-Jan-2026 12:00:00 +0000")').encode())
+            return 'OK', rows
+        if command == 'FETCH':
+            self.literal_loads += len(args[0].split(','))
+        return super().uid(command, *args)
+
+
+@pytest.mark.parametrize('name', ['list_messages', 'search_messages'])
+@pytest.mark.parametrize('filters', [dict(sender='RENÉ'), dict(sender='SENDER@EXAMPLE.INVALID'),
+                                    dict(recipient='reader'), dict(recipient='CC@EXAMPLE.INVALID'),
+                                    dict(subject='CAFÉ'), dict(sender='rené', recipient='copy', subject='café')])
+def test_two_stage_filters_and_order(name, filters):
+    client = EnvelopeIMAP()
+    result = mail.call(name, dict(folder='INBOX', limit=3, since='01-Jan-2026', unread=True, **filters),
+                       factory=lambda: client)
+    assert [m['uid'] for m in result['messages']] == ['5000', '4999', '4998']
+    assert result['complete'] and result['pages'] == 1 and result['scanned'] == 3
+    assert result['candidates'] == 5000 and result['oldest_scanned_date'] == '2026-01-01'
+    assert client.commands[0] == ('SELECT', '"INBOX"', True)
+    assert client.commands[1] == ('SEARCH', None, '(SINCE "01-Jan-2026" UNSEEN)')
+    assert client.literal_loads == 3
+    assert len(client.commands) == 4
+    assert all(not any(k in c[-1] for k in ('FROM', 'SUBJECT', 'TO ', 'CC '))
+               for c in client.commands if c[0] == 'SEARCH')
+
+
+@pytest.mark.parametrize('budget', ['count', 'time'])
+def test_partial_search_budget(monkeypatch, budget):
+    client = EnvelopeIMAP(count=401, matches=False)
+    if budget == 'count':
+        monkeypatch.setattr(mail, 'SEARCH_SCAN_MAX', 201)
+    else:
+        clock = Mock(return_value=0)
+        monkeypatch.setattr(mail.time, 'monotonic', clock)
+        original = client.uid
+        def advance(*args):
+            result = original(*args)
+            if args[0] == 'FETCH':
+                clock.return_value = 31
+            return result
+        client.uid = advance
+    result = mail.Mail(client).search(folder='INBOX', subject='absent')
+    assert not result['complete'] and not result['messages']
+    assert result['scanned'] == (201 if budget == 'count' else 200)
+    assert result['pages'] == (2 if budget == 'count' else 1)
+    assert result['oldest_scanned_date'] == '2026-01-01'
+
+
+def test_partial_search_preserves_matches(monkeypatch):
+    monkeypatch.setattr(mail, 'SEARCH_SCAN_MAX', 2)
+    result = mail.Mail(EnvelopeIMAP(count=3)).search(folder='INBOX', sender='sender', limit=3)
+    assert not result['complete']
+    assert [m['uid'] for m in result['messages']] == ['3', '2']
+
+
+def test_exhausted_and_empty_searches():
+    for count in (0, 401):
+        result = mail.Mail(EnvelopeIMAP(count=count, matches=False)).search(folder='INBOX', subject='absent')
+        assert result['complete'] and result['scanned'] == count and not result['messages']
+
+
+def test_envelope_split_literals_and_escapes():
+    values = mail.envelope_values([
+        (b'1 (ENVELOPE (NIL {5}', b'a"b\\c'),
+        b'NIL NIL NIL NIL NIL NIL NIL NIL) UID 7 INTERNALDATE "01-Jan-2026 12:00:00 +0000")'])
+    assert values['7']['ENVELOPE'][1] == 'a"b\\c'
+
+
+def assert_telemetry(record):
+    assert set(record) == {'v', 'ts', 'tool', 'total_ms', 'outcome', 'error_class', 'req_bytes',
+                           'resp_bytes', 'phase', 'requested', 'matched', 'chunks', 'candidates',
+                           'scanned', 'pages', 'complete'}
+    assert set(record['phase']) == {'connect', 'credentials', 'tls_context', 'tcp_greeting',
+                                    'starttls', 'capability', 'login', 'select', 'search',
+                                    'fetch', 'mutate', 'audit'}
+    assert record['v'] == 1 and record['total_ms'] >= 0
+    assert record['outcome'] in ('ok', 'tool_error', 'error', 'timeout', 'refused')
+    assert record['ts'].endswith('+00:00')
+
+
+@pytest.mark.parametrize('kind', ['ok', 'tool_error', 'error', 'timeout'])
+def test_telemetry_schema_and_privacy(caplog, kind):
+    client = EnvelopeIMAP()
+    factory = lambda: client
+    args = dict(folder='Folders/private-canary', sender='private-filter-canary', limit=2)
+    if kind == 'error':
+        factory = Mock(side_effect=RuntimeError('/private-path-canary'))
+    if kind == 'timeout':
+        factory = Mock(side_effect=TimeoutError('private-error-canary'))
+    if kind == 'tool_error':
+        args['limit'] = 51
+    try:
+        mail.call('search_messages', args, factory=factory)
+    except (PublicError, RuntimeError, TimeoutError):
+        pass
+    line = next(r.message for r in caplog.records if r.message.startswith('mail_call '))
+    record = json.loads(line.removeprefix('mail_call '))
+    assert_telemetry(record)
+    assert record['outcome'] == kind
+    assert 'canary' not in line and 'example.invalid' not in line
+    assert record['req_bytes'] == len(json.dumps(args).encode())
+
+
+def test_5000_message_command_counts():
+    before = EnvelopeIMAP()
+    before.uid('SEARCH', None, '(FROM "sender" SUBJECT "café")')
+    before.uid('FETCH', '4998,4999,5000', '(UID FLAGS RFC822.SIZE BODY.PEEK[HEADER.FIELDS (From)])')
+    after = EnvelopeIMAP()
+    mail.Mail(after).search(folder='INBOX', sender='sender', subject='café', limit=3)
+    # SEARCH literal loads: 5000 -> 0; search/fetch round trips: 2 -> 3.
+    assert before.literal_loads == 5003 and after.literal_loads == 3
+    assert len(before.commands) == 2 and len(after.commands) == 4  # after also EXAMINEs
+
+
+# Exercise imaplib's actual wire parser as well as the command-level fakes.
+@contextmanager
+def envelope_server(count=5000):
+    transport, peer = socket.socketpair()
+    model = EnvelopeIMAP(count=count)
+    failures = []
+
+    class Client(WireIMAP):
+        def _create_socket(self, timeout):
+            transport.settimeout(3)
+            return transport
+
+    def serve():
+        try:
+            peer.sendall(b'* OK synthetic server\r\n')
+            reader = peer.makefile('rb')
+            while line := reader.readline():
+                tag, command, *rest = line.decode('ascii').strip().split(' ', 2)
+                args = rest[0] if rest else ''
+                if command == 'CAPABILITY':
+                    peer.sendall(b'* CAPABILITY IMAP4rev1\r\n')
+                elif command == 'EXAMINE':
+                    model.select(args, readonly=True)
+                    peer.sendall(f'* {count} EXISTS\r\n* OK [UIDVALIDITY 1] valid\r\n'.encode())
+                elif command == 'UID':
+                    operation, values = args.split(' ', 1)
+                    if operation == 'SEARCH':
+                        _, data = model.uid('SEARCH', None, values)
+                        peer.sendall(b'* SEARCH ' + data[0] + b'\r\n')
+                    else:
+                        uids, fields = values.split(' ', 1)
+                        _, data = model.uid('FETCH', uids, fields)
+                        for row in data:
+                            if isinstance(row, bytes):
+                                sequence, attrs = row.split(b' ', 1)
+                                peer.sendall(b'* ' + sequence + b' FETCH ' + attrs + b'\r\n')
+                            else:
+                                attrs, raw = row
+                                sequence, attrs = attrs.split(b' ', 1)
+                                peer.sendall(b'* ' + sequence + b' FETCH ' + attrs[:-1] +
+                                             b' BODY[HEADER.FIELDS (From)] {' + str(len(raw)).encode() +
+                                             b'}\r\n' + raw + b')\r\n')
+                elif command == 'LOGOUT':
+                    peer.sendall(b'* BYE done\r\n' + tag.encode() + b' OK logout\r\n')
+                    break
+                else:
+                    raise AssertionError(command)
+                peer.sendall(tag.encode() + b' OK done\r\n')
+        except Exception as error:
+            failures.append(error)
+        finally:
+            peer.close()
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    client = Client('synthetic.invalid')
+    client.state = 'AUTH'  # Authentication is outside this search-only fixture.
+    try:
+        yield client, model
+    finally:
+        client.logout()
+        worker.join(3)
+        assert not worker.is_alive() and not failures
+
+
+def test_wire_5000_message_before_after():
+    with envelope_server() as (client, before):
+        client.select('"INBOX"', readonly=True)
+        mail.ok(client.uid('SEARCH', None, '(FROM "sender" SUBJECT "fixture")'))
+        mail.Mail(client).metadata_batch('INBOX', ['4998', '4999', '5000'], '1')
+    with envelope_server() as (client, after):
+        result = mail.Mail(client).search(folder='INBOX', sender='rené', subject='café', limit=3)
+    assert [m['uid'] for m in result['messages']] == ['5000', '4999', '4998']
+    assert result['complete'] and result['pages'] == 1
+    assert before.literal_loads == 5003 and after.literal_loads == 3
+    assert len(before.commands) == 3 and len(after.commands) == 4
+
+
+def test_total_includes_connect_audit_and_cleanup(monkeypatch, caplog):
+    clock = Mock(return_value=0)
+    monkeypatch.setattr(mail.time, 'monotonic', clock)
+    client = BatchIMAP(count=1)
+    def factory():
+        clock.return_value += .1
+        return client
+    def append(entry):
+        clock.return_value += .2
+    def logout():
+        clock.return_value += .3
+    client.logout = logout
+    mail.call('list_messages', {'folder': 'INBOX'}, factory=factory, journal=Mock(append=append))
+    record = json.loads(caplog.records[-1].message.removeprefix('mail_call '))
+    assert record['total_ms'] == 600
+    assert record['phase']['connect'] == 100 and record['phase']['audit'] == 200
+
+
+def test_wire_no_filter_path():
+    with envelope_server(count=10) as (client, model):
+        result = mail.Mail(client).search(folder='INBOX', limit=2)
+    assert [m['uid'] for m in result['messages']] == ['9', '10']
+    assert [c[0] for c in model.commands] == ['SELECT', 'SEARCH', 'FETCH']
+    assert model.literal_loads == 2
+
+
+def test_wire_default_scan_cap():
+    with envelope_server(count=5001) as (client, model):
+        result = mail.Mail(client).search(folder='INBOX', subject='absent')
+    assert not result['complete'] and result['scanned'] == 5000
+    assert result['pages'] == 25 and result['candidates'] == 5001
+    assert model.literal_loads == 0

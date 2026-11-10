@@ -1,6 +1,6 @@
 [project]
 name = "protonmcp"
-version = "0.1.0"
+version = "0.3.0"
 requires-python = ">=3.12"
 dependencies = ["PyJWT[crypto]>=2.15,<3"]
 
