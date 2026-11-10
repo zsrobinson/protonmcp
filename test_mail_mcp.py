@@ -753,3 +753,57 @@ def test_wire_default_scan_cap():
     assert not result['complete'] and result['scanned'] == 5000
     assert result['pages'] == 25 and result['candidates'] == 5001
     assert model.literal_loads == 0
+
+
+@pytest.mark.parametrize('rows', [
+    [b'1 (UID 1 UID 2 ENVELOPE (NIL NIL NIL NIL NIL NIL NIL NIL NIL NIL) INTERNALDATE "date")'],
+    [b'1 (UID 1 ENVELOPE (NIL NIL NIL NIL NIL NIL NIL NIL NIL NIL) INTERNALDATE "date")',
+     b'2 (UID 1 ENVELOPE (NIL NIL NIL NIL NIL NIL NIL NIL NIL NIL) INTERNALDATE "date")'],
+    [b'1 (UID 1 ENVELOPE (NIL NIL (("name" NIL "address")) NIL NIL NIL NIL NIL NIL NIL) INTERNALDATE "date")'],
+    [b'1 (UID 1 ENVELOPE (NIL (NIL) NIL NIL NIL NIL NIL NIL NIL NIL) INTERNALDATE "date")'],
+    [b'1 (UID 1 ENVELOPE (NIL "unterminated)'],
+    [b'1 (' + b'(' * 34 + b')' * 34 + b')'],
+    [(b'1 (UID 1 ENVELOPE (NIL {99}', b'bad')],
+    [(b'1 (UID 1 ENVELOPE (NIL {3}', 'bad')],
+    [None],
+    [b'1 (UID 0 ENVELOPE (NIL NIL NIL NIL NIL NIL NIL NIL NIL NIL) INTERNALDATE "date")'],
+])
+def test_envelope_malformed_fails_closed(rows):
+    with pytest.raises(PublicError, match='^Invalid envelope response$'):
+        mail.envelope_values(rows)
+
+
+def test_search_bad_envelope_logs_no_private_data(caplog):
+    client = EnvelopeIMAP()
+    original = client.uid
+    def bad_envelope(command, *args):
+        if command == 'FETCH':
+            return 'OK', [b'1 (UID 5000 ENVELOPE (NIL "private-subject-canary" NIL) private-folder-canary)']
+        return original(command, *args)
+    client.uid = bad_envelope
+    with pytest.raises(PublicError):
+        mail.call('search_messages', {'folder': 'private-folder-canary', 'sender': 'private-address-canary'},
+                  factory=lambda: client)
+    assert client.logged_out
+    assert 'canary' not in caplog.text
+    record = json.loads(caplog.records[-1].message.removeprefix('mail_call '))
+    assert_telemetry(record)
+    assert record['error_class'] == 'PublicError'
+
+
+def test_http_errors_never_print_tracebacks(capsys, caplog):
+    try:
+        raise ValueError('private-exception-canary')
+    except ValueError:
+        mail.BoundedHTTPServer.handle_error(None, None, None)
+    captured = capsys.readouterr()
+    assert not captured.out and not captured.err and not caplog.text
+
+
+def test_budget_return_closes_connection(monkeypatch):
+    monkeypatch.setattr(mail, 'SEARCH_SCAN_MAX', 1)
+    client = EnvelopeIMAP(count=2)
+    result = mail.call('search_messages', {'folder': 'INBOX', 'sender': 'sender', 'limit': 2},
+                       factory=lambda: client)
+    assert not result['complete'] and len(result['messages']) == 1
+    assert client.logged_out and mail._local.metrics is None

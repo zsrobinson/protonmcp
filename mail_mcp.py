@@ -220,25 +220,43 @@ def envelope_values(data):
     chunks = []
     for row in data:
         if isinstance(row, tuple):
+            if len(row) != 2 or any(not isinstance(v, bytes) for v in row):
+                raise PublicError('Invalid envelope response')
             prefix, literal = row
-            prefix = re.sub(rb'\{[0-9]+\}$', b'', prefix)
+            marker = re.search(rb'\{([0-9]+)\}$', prefix)
+            if not marker or int(marker[1]) != len(literal):
+                raise PublicError('Invalid envelope response')
+            prefix = prefix[:marker.start()]
             chunks.append(prefix + b'"' + literal.replace(b'\\', b'\\\\').replace(b'"', b'\\"') + b'"')
         elif isinstance(row, bytes):
             chunks.append(row)
+        else:
+            raise PublicError('Invalid envelope response')
     raw = b' '.join(chunks)
-    tokens = re.findall(rb'"(?:[^"\\]|\\.)*"|[()]|[^\s()]+', raw)
+    pattern = re.compile(rb'"(?:[^"\\]|\\.)*"|[()]|[^\s()"{}]+')
+    tokens = []
+    position = 0
+    while position < len(raw):
+        if raw[position:position + 1].isspace():
+            position += 1
+            continue
+        match = pattern.match(raw, position)
+        if not match:
+            raise PublicError('Invalid envelope response')
+        tokens.append(match[0])
+        position = match.end()
     index = 0
 
-    def value():
+    def value(depth=0):
         nonlocal index
-        if index >= len(tokens):
+        if depth > 32 or index >= len(tokens):
             raise PublicError('Invalid envelope response')
         token = tokens[index]
         index += 1
         if token == b'(':
             result = []
             while index < len(tokens) and tokens[index] != b')':
-                result.append(value())
+                result.append(value(depth + 1))
             if index == len(tokens):
                 raise PublicError('Invalid envelope response')
             index += 1
@@ -251,14 +269,32 @@ def envelope_values(data):
 
     result = {}
     while index < len(tokens):
-        value()  # Sequence number; identities always come from UID.
+        sequence = value()  # Identities always come from UID.
+        if not isinstance(sequence, str) or not re.fullmatch(r'[1-9][0-9]*', sequence):
+            raise PublicError('Invalid envelope response')
         attrs = value()
         if not isinstance(attrs, list) or len(attrs) % 2:
             raise PublicError('Invalid envelope response')
-        attrs = dict(zip(attrs[::2], attrs[1::2]))
-        uid = attrs.get('UID')
-        if not uid or uid in result or not isinstance(attrs.get('ENVELOPE'), list) or len(attrs['ENVELOPE']) != 10:
+        keys = attrs[::2]
+        if any(not isinstance(k, str) for k in keys) or len(set(keys)) != len(keys):
             raise PublicError('Invalid envelope response')
+        attrs = dict(zip(keys, attrs[1::2]))
+        uid, env = attrs.get('UID'), attrs.get('ENVELOPE')
+        if (set(attrs) != {'UID', 'ENVELOPE', 'INTERNALDATE'} or
+                not isinstance(uid, str) or not re.fullmatch(r'[1-9][0-9]{0,9}', uid) or uid in result or
+                not isinstance(attrs['INTERNALDATE'], str) or not isinstance(env, list) or len(env) != 10):
+            raise PublicError('Invalid envelope response')
+        for i in (0, 1, 8, 9):
+            if env[i] is not None and not isinstance(env[i], str):
+                raise PublicError('Invalid envelope response')
+        for addresses in env[2:8]:
+            if addresses is None:
+                continue
+            if not isinstance(addresses, list) or any(
+                not isinstance(a, list) or len(a) != 4 or
+                any(v is not None and not isinstance(v, str) for v in a) for a in addresses
+            ):
+                raise PublicError('Invalid envelope response')
         result[uid] = attrs
     return result
 
@@ -940,6 +976,9 @@ class BoundedHTTPServer(http.server.ThreadingHTTPServer):
         self._requests = threading.Condition()
         self._active_requests = 0
         super().__init__(*args, **kwargs)
+
+    def handle_error(self, request, client_address):
+        pass  # Never print request exceptions, traceback paths or mail data.
 
     def drain(self):
         self.draining.set()
