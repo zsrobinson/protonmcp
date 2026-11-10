@@ -201,3 +201,24 @@ def test_busy_call_does_not_block_ping(monkeypatch):
         server.shutdown()
         worker.join()
         server.server_close()
+
+
+def test_search_deadline_interrupts_transport(monkeypatch):
+    client = FakeIMAP()
+    client.sock = Mock()
+    monkeypatch.setattr(mail, 'SEARCH_TIMEOUT_SECONDS', 0.01)
+    def slow_search(*args):
+        assert client.sock.shutdown.called is False
+        threading.Event().wait(0.05)
+        return 'OK', [b'1']
+    client.uid = slow_search
+    with pytest.raises(PublicError, match='timed out'):
+        mail.Mail(client).search(folder='INBOX')
+    client.sock.shutdown.assert_called_once_with(socket.SHUT_RDWR)
+
+
+def test_search_read_timeout_is_controlled(monkeypatch):
+    client = FakeIMAP()
+    client.uid = Mock(side_effect=TimeoutError())
+    with pytest.raises(PublicError, match='timed out waiting for Bridge'):
+        mail.Mail(client).search(folder='INBOX')

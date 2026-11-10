@@ -55,7 +55,8 @@ logs, mail exports and Bridge state outside the checkout. Never commit captured 
 Tests use generated synthetic messages and local cryptographic fixtures only.
 
 Reads use read-only selection and BODY.PEEK. All Mail searches require `since` and
-`before`. Search and body results include a `web_url` only when Bridge supplies a
+`before`. Search network work has a 45-second deadline, including untagged IMAP
+progress; date bounds and limits do not guarantee fast All Mail scans. Search and body results include a `web_url` only when Bridge supplies a
 valid opaque Proton message ID; open with the matching signed-in account and grouping
 disabled. UIDs require matching UIDVALIDITY. Cleanup validates explicit identities,
 existing safe destinations and MOVE capability before changes, supports dry runs,

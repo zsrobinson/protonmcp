@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """Local MCP: separate header/body tools and logged cleanup, draft APPEND."""
 import email.policy
+from contextlib import contextmanager
 from email.parser import BytesParser
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
 import http.server
 import imaplib
 import json
+import logging
 import os
 from pathlib import Path
 import re
 import ssl
+import socket
 import threading
 from action_log import ActionLog, PublicError
 from uuid import uuid4
@@ -18,6 +21,7 @@ from access import configured_access
 
 MAX_MESSAGE = 2 * 1024 * 1024
 MAX_REQUEST = 128 * 1024
+SEARCH_TIMEOUT_SECONDS = 45
 PROTOCOLS = ('2025-03-26', '2025-06-18', '2025-11-25')
 
 
@@ -52,6 +56,42 @@ def message_web_url(headers):
         return None
     # No /u/0: the browser selects its signed-in account; use the Bridge account.
     return 'https://mail.proton.me/all-mail/' + ident
+
+
+@contextmanager
+def search_deadline(client):
+    """Interrupt the transport even if untagged IMAP progress keeps arriving."""
+    expired = threading.Event()
+
+    def interrupt():
+        expired.set()
+        try:
+            # imaplib.shutdown() closes its buffered reader first and can wait
+            # for the blocked read's lock. Shutdown the socket first instead.
+            client.sock.shutdown(socket.SHUT_RDWR)
+        except (OSError, AttributeError):
+            pass
+
+    timer = threading.Timer(SEARCH_TIMEOUT_SECONDS, interrupt)
+    timer.daemon = True
+    timer.start()
+    try:
+        try:
+            yield
+        except TimeoutError:
+            if not expired.is_set():
+                logging.warning('Mail search IMAP read timed out')
+                raise PublicError('Mail search timed out waiting for Bridge. Use INBOX or a narrower folder/date range.') from None
+        except Exception:
+            if not expired.is_set():
+                raise
+        if expired.is_set():
+            logging.warning('Mail search exceeded its %ss deadline; IMAP transport interrupted', SEARCH_TIMEOUT_SECONDS)
+            raise PublicError('Mail search timed out after ' + str(SEARCH_TIMEOUT_SECONDS)
+                              + 's. Use INBOX or a narrower folder/date range; All Mail may scan the whole mailbox.')
+    finally:
+        timer.cancel()
+        timer.join()  # No watchdog survives the operation or races the next call.
 
 
 class Mail:
@@ -113,6 +153,10 @@ class Mail:
                 'attachmentMetadata': 'Unknown: header-only IMAP cannot reliably count attachments.'}
 
     def search(self, folder='', sender='', recipient='', subject='', since='', before='', unread=False, label='', limit=20):
+        with search_deadline(self.client):
+            return self._search(folder, sender, recipient, subject, since, before, unread, label, limit)
+
+    def _search(self, folder, sender, recipient, subject, since, before, unread, label, limit):
         if label:
             label_folder = label if label.startswith('Labels/') else 'Labels/' + label
             if folder and folder != label_folder:
@@ -312,8 +356,8 @@ SEARCH = {'folder': S, 'sender': S, 'recipient': S, 'subject': S, 'since': S, 'b
           'unread': {'type': 'boolean'}, 'label': S,
           'limit': {'type': 'integer', 'minimum': 1, 'maximum': 50}}
 TOOLS = [tool('list_folders', 'HEADERS/METADATA ONLY: list folders. Never returns message bodies.', {}, []),
-         tool('list_messages', 'HEADERS ONLY: list message headers, flags, size; no bodies, snippets or attachment names. web_url opens that message in Proton web (grouping disabled, matching signed-in account), or is null. Supply folder or label. All Mail requires since and before; use a short date range.', SEARCH, []),
-         tool('search_messages', 'HEADERS ONLY: sender/recipient/subject/date/unread search in a folder or label mailbox. Never searches/returns bodies. web_url opens that message in Proton web (grouping disabled, matching signed-in account), or is null. All Mail requires since and before; use a short date range.', SEARCH, []),
+         tool('list_messages', 'HEADERS ONLY: list message headers, flags, size; no bodies, snippets or attachment names. web_url opens that message in Proton web (grouping disabled, matching signed-in account), or is null. Supply folder or label. All Mail requires since and before; use a short date range. Search network work has a 45s deadline; date bounds and limit do not guarantee fast All Mail scans.', SEARCH, []),
+         tool('search_messages', 'HEADERS ONLY: sender/recipient/subject/date/unread search in a folder or label mailbox. Never searches/returns bodies. web_url opens that message in Proton web (grouping disabled, matching signed-in account), or is null. All Mail requires since and before; use a short date range. Search network work has a 45s deadline; date bounds and limit do not guarantee fast All Mail scans.', SEARCH, []),
          tool('list_unsubscribe', 'HEADERS ONLY: list unsubscribe header values for explicit messages. Never opens URLs, makes requests or sends mail.',
               MESSAGES, list(MESSAGES)),
          tool('read_messages', 'BODY READ: returns message bodies and attachment names/sizes for up to 50 explicit refs. web_url opens that message in Proton web (grouping disabled, matching signed-in account), or is null. No attachment bytes. Set this tool to ask first in the client. Server does not enforce consent.',
@@ -465,7 +509,10 @@ def call(name, args, factory=connect, journal=None):
         try:
             client.logout()
         except Exception:
-            pass
+            try:
+                client.shutdown()  # LOGOUT can raise before imaplib closes an interrupted socket.
+            except Exception:
+                pass
 
 
 class BoundedHTTPServer(http.server.ThreadingHTTPServer):
